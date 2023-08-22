@@ -1,0 +1,25 @@
+menu "User Configuration"
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        help
+            SSID (network name) to connect to.
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        help
+            WiFi password (WPA or WPA2) to use.
+
+    config MQTT_BROKER
+        string "MQTT Broker URI"
+        default "mqtt://192.168.1.2:1883"
+
+    config MQTT_SET_HEIGHT_TOPIC
+        string "MQTT Set Height Topic"
+        default "desk/setheight"
+
+    config MQTT_HEIGHT_TOPIC
+        string "MQTT Height Topic"
+        default "desk/height"
+endmenu
