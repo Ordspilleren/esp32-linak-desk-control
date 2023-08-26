@@ -1,26 +1,28 @@
 #include <stdio.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "driver/uart.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "esp_event.h"
-#include "freertos/event_groups.h"
 #include "esp_log.h"
-#include "nvs.h"
+#include "esp_timer.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
+
+#include "driver/uart.h"
 #include "hal/uart_types.h"
 #include "hal/uart_ll.h"
-#include "esp_timer.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
-#include <lwip/netdb.h>
-#include "esp_netif.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
+
 #include "mqtt_client.h"
 
-static const char *TAG = "LIN_BUS";
+static const char *TAG = "LINAK_DESK";
 
 esp_mqtt_client_handle_t mqttClient;
 
@@ -37,6 +39,9 @@ static int s_retry_num = 0;
 #define MQTT_BROKER CONFIG_MQTT_BROKER
 #define MQTT_SET_HEIGHT_TOPIC CONFIG_MQTT_SET_HEIGHT_TOPIC
 #define MQTT_HEIGHT_TOPIC CONFIG_MQTT_HEIGHT_TOPIC
+
+#define RX_PIN 25
+#define TX_PIN 26
 
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
@@ -133,6 +138,7 @@ void wifi_init_sta(void)
 
 #define EX_UART_NUM UART_NUM_1
 #define BUF_SIZE (1024)
+
 // Define the UART event queue handle
 static QueueHandle_t uart0_queue;
 
@@ -173,98 +179,6 @@ static void uart_event_task(void *pvParameters)
     static size_t rxd_len = 0;
     static size_t prbs_seq = 0;
 
-    /*
-    while (1)
-    {
-        // bzero(dtmp, BUF_SIZE);
-
-        // Read data from the UART
-        int len = uart_read_bytes(EX_UART_NUM, dtmp, 1, 20 / portTICK_PERIOD_MS);
-
-        uint8_t data = dtmp[0];
-
-        if (data == 0x00)
-        {
-            break_detected = true;
-            if (current_pid >= 0)
-            {
-                rxbuf[0] = current_pid;
-                rx_len = rxd_len;
-                xSemaphoreGive(gLinSemaphoreId);
-            }
-            rxd_len = 0;
-            current_pid = -1;
-        }
-        else if (break_detected)
-        {
-            if (rxd_len == 0)
-            {
-                // This is the PID. It determines what action we can take
-                switch (data)
-                {
-                case 0x80:
-                    // Ref1 position PID -> motor will answer
-                    current_pid = 0x80;
-                    break;
-                case 0x64:;
-                    break_detected = false;
-                    // Request power -> always respond
-                    // Write TX data directly since we can (TX FIFO can contain two bytes)
-                    uint8_t frame[] = {0x9A, 0x01};
-                    uart_write_bytes(EX_UART_NUM, &frame, 2);
-                    uart_flush_input(EX_UART_NUM);
-                    // uart_tx_chars(EX_UART_NUM, &frame, 2);
-                    break;
-                case 0xE7:
-                    break_detected = false;
-                    // Safety sequence -> respond in sequence for as long as there is an active command
-                    current_pid = -1; // Discard - do not need to make thread aware of PRBS
-
-                    if (tx_len > 0)
-                    {
-                        // Write TX data directly since we can (TX FIFO can contain two bytes)
-                        uart_write_bytes(EX_UART_NUM, &prbs_sequence[prbs_seq], 2);
-                        uart_flush_input(EX_UART_NUM);
-
-                        //uart_tx_chars(EX_UART_NUM, (char *)&prbs_sequence[prbs_seq], 2);
-
-                        ESP_LOG_BUFFER_HEX(TAG, &prbs_sequence[prbs_seq], 2);
-
-                        // Progress with next PRBS sequence (unless it's updated again by HS2)
-                        prbs_seq += 1;
-                        if (prbs_seq >= 9)
-                            prbs_seq = 0;
-                    }
-                    break;
-                case 0xCA:
-                    break_detected = false;
-                    // Ref1 input -> respond with command if actual
-                    if (tx_len == 4 && txbuf[0] == 0xCA)
-                    {
-                        uint8_t frame[] = {txbuf[1], txbuf[2], txbuf[3]};
-                        uart_write_bytes(EX_UART_NUM, &frame, 3);
-                        uart_flush_input(EX_UART_NUM);
-                        // uart_tx_chars(EX_UART_NUM, &frame, 3);
-                    }
-                    break;
-                default:
-                    current_pid = -1; // Set PID to discard this message
-                    break_detected = false;
-                    break;
-                }
-            }
-            else if (rxd_len < sizeof(rxbuf))
-            {
-                if (current_pid >= 0)
-                {
-                    rxbuf[rxd_len] = data;
-                }
-            }
-            rxd_len += 1;
-        }
-    }
-    */
-
     for (;;)
     {
         // Waiting for UART event.
@@ -273,14 +187,10 @@ static void uart_event_task(void *pvParameters)
             bzero(dtmp, BUF_SIZE);
             switch (event.type)
             {
-            // Event of UART receving data
-            // We'd better handler data event fast, there would be much more data events than
-            // other types of events. If we take too much time on data event, the queue might be full.
+            // Event of UART receving data.
+            // This will contain the bytes immidiatly following the 13 bit break since we cleared the RX buffer.
             case UART_DATA:;
                 int len = uart_read_bytes(EX_UART_NUM, dtmp, event.size, 0);
-
-                // send(sock, (const char *) dtmp, event.size, MSG_DONTWAIT);
-                // printf((const char *) dtmp);
 
                 for (int i = 0; i < len; i++)
                 {
@@ -288,7 +198,7 @@ static void uart_event_task(void *pvParameters)
 
                     if (rxd_len == 0)
                     {
-                        // This is the PID. It determines what action we can take
+                        // This is the PID. It determines what action we can take.
                         switch (data)
                         {
                         case 0x80:
@@ -297,10 +207,8 @@ static void uart_event_task(void *pvParameters)
                             break;
                         case 0x64:;
                             // Request power -> always respond
-                            // Write TX data directly since we can (TX FIFO can contain two bytes)
                             static const uint8_t frame[2] = {0x9A, 0x01};
                             uart_write_bytes(EX_UART_NUM, &frame, 2);
-                            // uart_tx_chars(EX_UART_NUM, &frame, 2);
                             break;
                         case 0xE7:
                             // Safety sequence -> respond in sequence for as long as there is an active command
@@ -308,12 +216,7 @@ static void uart_event_task(void *pvParameters)
 
                             if (tx_len > 0)
                             {
-                                // Write TX data directly since we can (TX FIFO can contain two bytes)
                                 uart_write_bytes(EX_UART_NUM, &prbs_sequence[prbs_seq], 2);
-
-                                // uart_tx_chars(EX_UART_NUM, (char*) &prbs_sequence[prbs_seq], 2);
-
-                                // ESP_LOG_BUFFER_HEX(TAG, &prbs_sequence[prbs_seq], 2);
 
                                 // Progress with next PRBS sequence (unless it's updated again by HS2)
                                 prbs_seq += 1;
@@ -322,12 +225,11 @@ static void uart_event_task(void *pvParameters)
                             }
                             break;
                         case 0xCA:
-                            // Ref1 input -> respond with command if actual
+                            // Ref1 input -> respond with command if there is one
                             if (tx_len == 4 && txbuf[0] == 0xCA)
                             {
                                 uint8_t frame[3] = {txbuf[1], txbuf[2], txbuf[3]};
                                 uart_write_bytes(EX_UART_NUM, &frame, 3);
-                                // uart_tx_chars(EX_UART_NUM, &frame, 3);
                             }
                             break;
                         default:
@@ -365,14 +267,9 @@ static void uart_event_task(void *pvParameters)
                 xQueueReset(uart0_queue);
                 break;
 
-            // Event of UART RX break detected
+            // Event of UART RX break detected.
+            // Flush the RX buffer and reset the LIN message. First byte of the next DATA event should be the PID.
             case UART_BREAK:
-                // ESP_LOGI(TAG, "uart rx break");
-                //   in_break_field = true;
-
-                // ESP_LOGI(TAG, "break detected");
-                // ESP_LOG_BUFFER_HEX(TAG, &slave_hdr_buf, sizeof(slave_hdr_buf));
-
                 uart_flush_input(EX_UART_NUM);
 
                 if (current_pid >= 0)
@@ -432,7 +329,6 @@ static void desk_task(void *arg)
     while (1)
     {
         xSemaphoreTake(gLinSemaphoreId, portMAX_DELAY);
-        // vTaskDelay(500 / portTICK_RATE_MS);
 
         // Got poked by ISR
         if (rxbuf[0] == 0x80)
@@ -447,7 +343,7 @@ static void desk_task(void *arg)
 
                 if (current_height == 0)
                 {
-                    // Update attribute
+                    // Publish current height to MQTT.
                     char payload[6];
                     snprintf(payload, sizeof(payload), "%u", pos);
                     esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
@@ -469,8 +365,6 @@ static void desk_task(void *arg)
                 }
             }
 
-            // We process the next action to take upon reception of the motor position as
-            // a form of rate limiting on the LIN thread.
             if (movement_requested)
             {
                 if (!is_moving)
@@ -493,6 +387,8 @@ static void desk_task(void *arg)
                         is_moving = true;
                     }
                 }
+                // We could just check if the current height equals the target, but sometimes the current height reading stops just shy of the target.
+                // TODO: Is probably related to how we read from UART, the last height reading gets missed.
                 else if (movement_blocked || (current_height > current_target_height - 2 && current_height < current_target_height + 2))
                 {
                     ESP_LOGI(TAG, "reached target");
@@ -502,7 +398,7 @@ static void desk_task(void *arg)
                     movement_requested = false;
                     movement_blocked = false;
 
-                    // Update attribute
+                    // Publish current height to MQTT.
                     char payload[6];
                     snprintf(payload, sizeof(payload), "%u", current_height);
                     esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
@@ -523,7 +419,7 @@ static void desk_task(void *arg)
                     movement_requested = false;
                     movement_blocked = false;
 
-                    // Update attribute
+                    // Publish current height to MQTT.
                     char payload[6];
                     snprintf(payload, sizeof(payload), "%u", current_height);
                     esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
@@ -581,6 +477,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             {
                 target_height = (uint16_t)received_long;
                 movement_requested = true;
+
+                // We received a new height, release the semaphore to let the desk task determine what to do.
+                // Not sure if this is the best way to do it, but it works.
                 xSemaphoreGive(gLinSemaphoreId);
             }
             else
@@ -625,38 +524,36 @@ void app_main()
 
     // Install UART driver using the event queue
     uart_driver_install(EX_UART_NUM, BUF_SIZE * 2, BUF_SIZE * 2, 10, &uart0_queue, 0);
-    ESP_LOGI(TAG, "after driver");
 
     // Configure UART parameters
     uart_config_t uart_config = {
         .baud_rate = 19200,
-        //.baud_rate = 74880,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE};
     uart_param_config(EX_UART_NUM, &uart_config);
-    ESP_LOGI(TAG, "before swap");
-    ESP_ERROR_CHECK(uart_set_pin(EX_UART_NUM, 26, 25, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_set_pin(EX_UART_NUM, TX_PIN, RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
+    // Set the RX full threshold as low as possible while still allowing breaks to be detected.
+    // Also set the timeout for interrupts as low as possible.
+    // This seems to lower the delay between receiving bits and being able to react on them, allowing us to reply to LIN packets in time.
     uart_set_rx_full_threshold(EX_UART_NUM, 12);
-    // uart_set_rx_full_threshold(EX_UART_NUM, 1);
-    // uart_set_tx_empty_threshold(EX_UART_NUM, 2);
-
     uart_set_rx_timeout(EX_UART_NUM, 1);
     uart_set_always_rx_timeout(EX_UART_NUM, true);
 
     uart_enable_rx_intr(EX_UART_NUM);
     uart_disable_tx_intr(EX_UART_NUM);
-    uart_set_line_inverse(EX_UART_NUM, UART_SIGNAL_TXD_INV);
 
-    ESP_LOGI(TAG, "after uart conf");
+    // Invert TX since the NPN transistor is left open when connected to ground.
+    uart_set_line_inverse(EX_UART_NUM, UART_SIGNAL_TXD_INV);
 
     // Create UART event task
     xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 12, NULL);
-    ESP_LOGI(TAG, "after uart task");
+
+    // Create task for handling desk movement logic
     xTaskCreate(desk_task, "desk_task", 2048, NULL, 12, NULL);
-    ESP_LOGI(TAG, "after desk task");
+
+    // Start MQTT
     mqtt_app_start();
-    ESP_LOGI(TAG, "after mqtt start");
 }

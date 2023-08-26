@@ -15,6 +15,10 @@ Full credit for the schematic goes to [github.com/stevew817/linak_desk](https://
 
 ![](./schematic.png)
 
+I use a 2N2222 transistor for Q1. The exact resistors used don't matter much, as long as the resulting voltage divider brings the 12V down to ~3V.
+
+Wire up RX and TX to the pins defined in `RX_PIN` and `TX_PIN` in the code.
+
 ## Home Assistant Integration
 
 By default, this project exposes two topics to MQTT that can easily be integrated into Home Assistant: `height` and `setheight`.
@@ -38,6 +42,15 @@ For controlling the desk from the Home Assistant UI, I have created a custom Til
 ![](./tile-card.png)
 
 The sit and stand heights can be configured through the UI.
+
+## Current issues
+
+For the most part, everything works as you would expect, but there are a few small issues that need to be fixed / implemented:
+- Occasionally the desk will stop mid-movement, but will resume quickly.
+    - This is most likely due to a brief failure in replying with the PBRS sequence. Needs to be looked into.
+- When first started, the desk won't respond to commands until the physical switch is pressed.
+    - This is most likely because the desk controller sleeps until woken up, which can only be done with a physical switch or by implementing HB04.
+    - After it has been woken up however, it will stay on while the ESP32 is running.
 
 # References
 - [github.com/stevew817/linak_desk](https://github.com/stevew817/linak_desk): The general approach to reading the LIN Bus frames and the schematic have been borrowed from here.
