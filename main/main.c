@@ -173,7 +173,7 @@ static const uint8_t prbs_sequence[9][2] = {
 static void uart_event_task(void *pvParameters)
 {
     uart_event_t event;
-    uint8_t *dtmp = (uint8_t *)malloc(BUF_SIZE);
+    uint8_t data;
 
     static int current_pid = -1;
     static size_t rxd_len = 0;
@@ -184,68 +184,62 @@ static void uart_event_task(void *pvParameters)
         // Waiting for UART event.
         if (xQueueReceive(uart0_queue, (void *)&event, (TickType_t)portMAX_DELAY))
         {
-            bzero(dtmp, BUF_SIZE);
             switch (event.type)
             {
             // Event of UART receving data.
-            // This will contain the bytes immidiatly following the 13 bit break since we cleared the RX buffer.
+            // This will contain the byte immidiatly following the 13 bit break since we cleared the RX buffer.
             case UART_DATA:;
-                int len = uart_read_bytes(EX_UART_NUM, dtmp, event.size, 0);
+                uart_read_bytes(EX_UART_NUM, &data, 1, 0);
 
-                for (int i = 0; i < len; i++)
+                if (rxd_len == 0)
                 {
-                    uint8_t data = dtmp[i];
-
-                    if (rxd_len == 0)
+                    // This is the PID. It determines what action we can take.
+                    switch (data)
                     {
-                        // This is the PID. It determines what action we can take.
-                        switch (data)
-                        {
-                        case 0x80:
-                            // Ref1 position PID -> motor will answer
-                            current_pid = 0x80;
-                            break;
-                        case 0x64:;
-                            // Request power -> always respond
-                            static const uint8_t frame[2] = {0x9A, 0x01};
-                            uart_write_bytes(EX_UART_NUM, &frame, 2);
-                            break;
-                        case 0xE7:
-                            // Safety sequence -> respond in sequence for as long as there is an active command
-                            current_pid = -1; // Discard - do not need to make thread aware of PRBS
+                    case 0x80:
+                        // Ref1 position PID -> motor will answer
+                        current_pid = 0x80;
+                        break;
+                    case 0x64:;
+                        // Request power -> always respond
+                        static const uint8_t frame[2] = {0x9A, 0x01};
+                        uart_tx_chars(EX_UART_NUM, (char *)&frame, 2);
+                        break;
+                    case 0xE7:
+                        // Safety sequence -> respond in sequence for as long as there is an active command
+                        current_pid = -1; // Discard - do not need to make thread aware of PRBS
 
-                            if (tx_len > 0)
-                            {
-                                uart_write_bytes(EX_UART_NUM, &prbs_sequence[prbs_seq], 2);
-
-                                // Progress with next PRBS sequence (unless it's updated again by HS2)
-                                prbs_seq += 1;
-                                if (prbs_seq >= 9)
-                                    prbs_seq = 0;
-                            }
-                            break;
-                        case 0xCA:
-                            // Ref1 input -> respond with command if there is one
-                            if (tx_len == 4 && txbuf[0] == 0xCA)
-                            {
-                                uint8_t frame[3] = {txbuf[1], txbuf[2], txbuf[3]};
-                                uart_write_bytes(EX_UART_NUM, &frame, 3);
-                            }
-                            break;
-                        default:
-                            current_pid = -1; // Set PID to discard this message
-                            break;
-                        }
-                    }
-                    else if (rxd_len < sizeof(rxbuf))
-                    {
-                        if (current_pid >= 0)
+                        if (tx_len > 0)
                         {
-                            rxbuf[rxd_len] = data;
+                            uart_tx_chars(EX_UART_NUM, (char *)&prbs_sequence[prbs_seq], 2);
+
+                            // Progress with next PRBS sequence (unless it's updated again by HS2)
+                            prbs_seq += 1;
+                            if (prbs_seq >= 9)
+                                prbs_seq = 0;
                         }
+                        break;
+                    case 0xCA:
+                        // Ref1 input -> respond with command if there is one
+                        if (tx_len == 4 && txbuf[0] == 0xCA)
+                        {
+                            uint8_t frame[3] = {txbuf[1], txbuf[2], txbuf[3]};
+                            uart_tx_chars(EX_UART_NUM, (char *)&frame, 3);
+                        }
+                        break;
+                    default:
+                        current_pid = -1; // Set PID to discard this message
+                        break;
                     }
-                    rxd_len += 1;
                 }
+                else if (rxd_len < sizeof(rxbuf))
+                {
+                    if (current_pid >= 0)
+                    {
+                        rxbuf[rxd_len] = data;
+                    }
+                }
+                rxd_len += 1;
                 break;
 
             // Event of HW FIFO overflow detected
@@ -299,8 +293,6 @@ static void uart_event_task(void *pvParameters)
         }
     }
 
-    free(dtmp);
-    dtmp = NULL;
     vTaskDelete(NULL);
 }
 
@@ -387,9 +379,7 @@ static void desk_task(void *arg)
                         is_moving = true;
                     }
                 }
-                // We could just check if the current height equals the target, but sometimes the current height reading stops just shy of the target.
-                // TODO: Is probably related to how we read from UART, the last height reading gets missed.
-                else if (movement_blocked || (current_height > current_target_height - 2 && current_height < current_target_height + 2))
+                else if (movement_blocked || (current_height == current_target_height))
                 {
                     ESP_LOGI(TAG, "reached target");
                     // Made it to target, or motor stopped by itself
@@ -538,7 +528,7 @@ void app_main()
     // Set the RX full threshold as low as possible while still allowing breaks to be detected.
     // Also set the timeout for interrupts as low as possible.
     // This seems to lower the delay between receiving bits and being able to react on them, allowing us to reply to LIN packets in time.
-    uart_set_rx_full_threshold(EX_UART_NUM, 12);
+    uart_set_rx_full_threshold(EX_UART_NUM, 1);
     uart_set_rx_timeout(EX_UART_NUM, 1);
     uart_set_always_rx_timeout(EX_UART_NUM, true);
 
@@ -549,10 +539,10 @@ void app_main()
     uart_set_line_inverse(EX_UART_NUM, UART_SIGNAL_TXD_INV);
 
     // Create UART event task
-    xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 12, NULL);
+    xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 3, NULL);
 
     // Create task for handling desk movement logic
-    xTaskCreate(desk_task, "desk_task", 2048, NULL, 12, NULL);
+    xTaskCreate(desk_task, "desk_task", 2048, NULL, 2, NULL);
 
     // Start MQTT
     mqtt_app_start();
