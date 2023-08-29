@@ -329,9 +329,7 @@ static void desk_task(void *arg)
 
             if (pos != current_height)
             {
-                char buffer[60];
-                sprintf(buffer, "current id: %x, current pos: %u\n", rxbuf[0], (unsigned int)pos);
-                printf(buffer);
+                ESP_LOGI(TAG, "current id: %x, current pos: %u\n", rxbuf[0], (unsigned int)pos);
 
                 if (current_height == 0)
                 {
@@ -342,18 +340,18 @@ static void desk_task(void *arg)
                 }
 
                 current_height = pos;
+            }
 
-                if (is_moving)
+            if (is_moving)
+            {
+                if (last_height != current_height)
                 {
-                    if (last_height != current_height)
-                    {
-                        last_height = current_height;
-                        last_tick = esp_timer_get_time();
-                    }
-                    else if (esp_timer_get_time() >= last_tick + timeout_ticks)
-                    {
-                        movement_blocked = true;
-                    }
+                    last_height = current_height;
+                    last_tick = esp_timer_get_time();
+                }
+                else if (esp_timer_get_time() >= last_tick + timeout_ticks)
+                {
+                    movement_blocked = true;
                 }
             }
 
@@ -363,9 +361,7 @@ static void desk_task(void *arg)
                 {
                     if (current_height != target_height)
                     {
-                        char buffer[60];
-                        sprintf(buffer, "movement requested, current: %d, target: %d\n", current_height, target_height);
-                        printf(buffer);
+                        ESP_LOGI(TAG, "movement requested, current: %d, target: %d\n", current_height, target_height);
 
                         current_target_height = target_height;
                         txbuf[0] = 0xCA;
@@ -513,7 +509,7 @@ void app_main()
     wifi_init_sta();
 
     // Install UART driver using the event queue
-    uart_driver_install(EX_UART_NUM, BUF_SIZE * 2, BUF_SIZE * 2, 10, &uart0_queue, 0);
+    uart_driver_install(EX_UART_NUM, BUF_SIZE * 2, 0, 10, &uart0_queue, 0);
 
     // Configure UART parameters
     uart_config_t uart_config = {

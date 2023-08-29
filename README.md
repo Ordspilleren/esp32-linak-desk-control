@@ -19,6 +19,10 @@ I use a 2N2222 transistor for Q1. The exact resistors used don't matter much, as
 
 Wire up RX and TX to the pins defined in `RX_PIN` and `TX_PIN` in the code.
 
+## ESP-IDF Configuration
+
+Using menuconfig, update the variables within `User Configuration` to match your preferences.
+
 ## Home Assistant Integration
 
 By default, this project exposes two topics to MQTT that can easily be integrated into Home Assistant: `height` and `setheight`.
