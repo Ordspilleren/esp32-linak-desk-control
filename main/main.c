@@ -7,6 +7,7 @@
 #include "nvs_flash.h"
 
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "hal/uart_types.h"
 #include "hal/uart_ll.h"
 
@@ -40,8 +41,9 @@ static int s_retry_num = 0;
 #define MQTT_SET_HEIGHT_TOPIC CONFIG_MQTT_SET_HEIGHT_TOPIC
 #define MQTT_HEIGHT_TOPIC CONFIG_MQTT_HEIGHT_TOPIC
 
-#define RX_PIN 25
-#define TX_PIN 26
+#define RX_PIN 0
+#define TX_PIN 1
+#define WAKE_UP_PIN GPIO_NUM_12
 
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
@@ -155,7 +157,7 @@ volatile uint16_t current_target_height = 0;
 volatile bool is_moving = false;
 volatile bool movement_requested = false;
 volatile bool movement_blocked = false;
-static uint32_t timeout_ticks = 500000;
+static int64_t timeout_ticks = 500000;
 
 // PRBS (safety sequence) responses
 static const uint8_t prbs_sequence[9][2] = {
@@ -316,7 +318,7 @@ static void desk_task(void *arg)
 
     ESP_LOGI(TAG, "desk task");
 
-    uint32_t last_tick = 0;
+    int64_t last_tick = 0;
     uint16_t last_height = 0;
     while (1)
     {
@@ -329,7 +331,7 @@ static void desk_task(void *arg)
 
             if (pos != current_height)
             {
-                ESP_LOGI(TAG, "current id: %x, current pos: %u\n", rxbuf[0], (unsigned int)pos);
+                ESP_LOGI(TAG, "current id: %x, current pos: %u", rxbuf[0], (unsigned int)pos);
 
                 if (current_height == 0)
                 {
@@ -361,7 +363,7 @@ static void desk_task(void *arg)
                 {
                     if (current_height != target_height)
                     {
-                        ESP_LOGI(TAG, "movement requested, current: %d, target: %d\n", current_height, target_height);
+                        ESP_LOGI(TAG, "movement requested, current: %d, target: %d", current_height, target_height);
 
                         current_target_height = target_height;
                         txbuf[0] = 0xCA;
@@ -496,6 +498,11 @@ static void mqtt_app_start(void)
 
 void app_main()
 {
+    // Bring to ground to not interfere with passive matrix scanning.
+    // This actually pulls HB04 away from GND.
+    gpio_set_direction(WAKE_UP_PIN, GPIO_MODE_OUTPUT_OD);
+    gpio_set_level(WAKE_UP_PIN, 0);
+
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
