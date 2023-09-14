@@ -160,6 +160,8 @@ volatile bool movement_blocked = false;
 static int64_t timeout_ticks = 500000;
 
 // PRBS (safety sequence) responses
+// The first byte is the actual PRBS number.
+// The second byte is the checksum.
 static const uint8_t prbs_sequence[9][2] = {
     {0x3F, 0xD8},
     {0xDF, 0x38},
@@ -267,6 +269,7 @@ static void uart_event_task(void *pvParameters)
             // Event of UART RX break detected.
             // Flush the RX buffer and reset the LIN message. First byte of the next DATA event should be the PID.
             case UART_BREAK:
+                uart_wait_tx_done(EX_UART_NUM, 100);
                 uart_flush_input(EX_UART_NUM);
 
                 if (current_pid >= 0)
