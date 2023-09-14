@@ -29,7 +29,7 @@ esp_mqtt_client_handle_t mqttClient;
 
 #define ESP_WIFI_SSID CONFIG_WIFI_SSID
 #define ESP_WIFI_PASS CONFIG_WIFI_PASSWORD
-#define ESP_MAXIMUM_RETRY 5
+#define ESP_MAXIMUM_RETRY 10
 
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -204,8 +204,9 @@ static void uart_event_task(void *pvParameters)
                         break;
                     case 0x64:;
                         // Request power -> always respond
-                        static const uint8_t frame[2] = {0x9A, 0x01};
-                        uart_tx_chars(EX_UART_NUM, (char *)&frame, 2);
+                        // Uncomment the below if using the original circuit from stevew817.
+                        //static const uint8_t frame[2] = {0x9A, 0x01};
+                        //uart_tx_chars(EX_UART_NUM, (char *)&frame, 2);
                         break;
                     case 0xE7:
                         // Safety sequence -> respond in sequence for as long as there is an active command
@@ -365,6 +366,10 @@ static void desk_task(void *arg)
                     {
                         ESP_LOGI(TAG, "movement requested, current: %d, target: %d", current_height, target_height);
 
+                        // Power on the desk.
+                        // Comment the below if using the original circuit from stevew817.
+                        gpio_set_level(WAKE_UP_PIN, 1);
+
                         current_target_height = target_height;
                         txbuf[0] = 0xCA;
                         txbuf[1] = current_target_height & 0xFF;
@@ -390,6 +395,10 @@ static void desk_task(void *arg)
                     char payload[6];
                     snprintf(payload, sizeof(payload), "%u", current_height);
                     esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
+
+                    // Power off the desk.
+                    // Comment the below if using the original circuit from stevew817.
+                    gpio_set_level(WAKE_UP_PIN, 0);
                 }
                 else if (target_height != current_target_height)
                 {
@@ -411,6 +420,10 @@ static void desk_task(void *arg)
                     char payload[6];
                     snprintf(payload, sizeof(payload), "%u", current_height);
                     esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
+
+                    // Power off the desk.
+                    // Comment the below if using the original circuit from stevew817.
+                    gpio_set_level(WAKE_UP_PIN, 0);
                 }
             }
         }
@@ -431,8 +444,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        esp_mqtt_client_reconnect(client);
         break;
-
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
         break;
@@ -500,8 +513,14 @@ void app_main()
 {
     // Bring to ground to not interfere with passive matrix scanning.
     // This actually pulls HB04 away from GND.
-    gpio_set_direction(WAKE_UP_PIN, GPIO_MODE_OUTPUT_OD);
-    gpio_set_level(WAKE_UP_PIN, 0);
+    // Uncomment the below if using the original circuit from stevew817.
+    //gpio_set_direction(WAKE_UP_PIN, GPIO_MODE_OUTPUT_OD);
+    //gpio_set_level(WAKE_UP_PIN, 0);
+
+    // I am powering my ESP32 from USB, so I use a slightly different circuit with a resistor from base to GND instead of base to HB04.
+    // Setting the pin to low powers off the desk entirely, setting it high keeps the desk on.
+    // Comment the below if using the original circuit from stevew817.
+    gpio_set_direction(WAKE_UP_PIN, GPIO_MODE_OUTPUT);
 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
