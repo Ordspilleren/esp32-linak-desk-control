@@ -372,6 +372,7 @@ static void desk_task(void *arg)
                         // Power on the desk.
                         // Comment the below if using the original circuit from stevew817.
                         gpio_set_level(WAKE_UP_PIN, 1);
+                        gpio_set_level(WAKE_UP_PIN, 0);
 
                         current_target_height = target_height;
                         txbuf[0] = 0xCA;
@@ -398,10 +399,6 @@ static void desk_task(void *arg)
                     char payload[6];
                     snprintf(payload, sizeof(payload), "%u", current_height);
                     esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
-
-                    // Power off the desk.
-                    // Comment the below if using the original circuit from stevew817.
-                    gpio_set_level(WAKE_UP_PIN, 0);
                 }
                 else if (target_height != current_target_height)
                 {
@@ -423,10 +420,6 @@ static void desk_task(void *arg)
                     char payload[6];
                     snprintf(payload, sizeof(payload), "%u", current_height);
                     esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
-
-                    // Power off the desk.
-                    // Comment the below if using the original circuit from stevew817.
-                    gpio_set_level(WAKE_UP_PIN, 0);
                 }
             }
         }
