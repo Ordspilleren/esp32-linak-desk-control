@@ -23,6 +23,8 @@
 
 #include "mqtt_client.h"
 
+#include "stdatomic.h"
+
 static const char *TAG = "LINAK_DESK";
 
 esp_mqtt_client_handle_t mqttClient;
@@ -36,6 +38,7 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_FAIL_BIT BIT1
 
 static int s_retry_num = 0;
+static bool wifi_connected = false; // Track WiFi connection status
 
 #define MQTT_BROKER CONFIG_MQTT_BROKER
 #define MQTT_SET_HEIGHT_TOPIC CONFIG_MQTT_SET_HEIGHT_TOPIC
@@ -54,6 +57,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
+        wifi_connected = false; // Update connection status
         if (s_retry_num < ESP_MAXIMUM_RETRY)
         {
             esp_wifi_connect();
@@ -71,7 +75,39 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+        wifi_connected = true; // Update connection status
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+// WiFi monitoring task to handle reconnections
+static void wifi_monitor_task(void *pvParameters)
+{
+    const TickType_t check_interval = pdMS_TO_TICKS(10000); // Check every 10 seconds
+
+    while (1)
+    {
+        vTaskDelay(check_interval);
+
+        // Check if WiFi is still connected
+        wifi_ap_record_t ap_info;
+        esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
+
+        if (ret != ESP_OK)
+        {
+            // WiFi is not connected
+            if (wifi_connected)
+            {
+                ESP_LOGW(TAG, "WiFi connection lost, attempting to reconnect...");
+                wifi_connected = false;
+                s_retry_num = 0; // Reset retry counter
+                esp_wifi_connect();
+            }
+        }
+        else
+        {
+            // WiFi is connected
+        }
     }
 }
 
@@ -136,6 +172,9 @@ void wifi_init_sta(void)
     {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
+
+    // Start WiFi monitoring task after initial connection attempt
+    xTaskCreate(wifi_monitor_task, "wifi_monitor_task", 2048, NULL, 1, NULL);
 }
 
 #define EX_UART_NUM UART_NUM_1
@@ -144,7 +183,11 @@ void wifi_init_sta(void)
 // Define the UART event queue handle
 static QueueHandle_t uart0_queue;
 
-SemaphoreHandle_t gLinSemaphoreId = NULL;
+// Replace gLinSemaphoreId for this purpose, we will use it as a proper mutex
+SemaphoreHandle_t gLinDataMutex = NULL;
+
+// The semaphore to wake the desk_task can be separate or you can use task notifications
+SemaphoreHandle_t gDeskTaskSemaphore = NULL;
 
 volatile uint8_t rxbuf[10] = {0};
 volatile size_t rx_len = 0;
@@ -152,12 +195,12 @@ volatile uint8_t txbuf[8] = {0};
 volatile size_t tx_len = 0;
 
 volatile uint16_t target_height = 0;
-volatile uint16_t current_height = 0;
+atomic_uint_least16_t current_height = 0;
 volatile uint16_t current_target_height = 0;
 volatile bool is_moving = false;
 volatile bool movement_requested = false;
 volatile bool movement_blocked = false;
-static int64_t timeout_ticks = 500000;
+static int64_t timeout_ticks = 1500000;
 
 // PRBS (safety sequence) responses
 // The first byte is the actual PRBS number.
@@ -174,6 +217,8 @@ static const uint8_t prbs_sequence[9][2] = {
     {0x80, 0x97},
 };
 
+static size_t prbs_seq = 0;
+
 static void uart_event_task(void *pvParameters)
 {
     uart_event_t event;
@@ -181,7 +226,6 @@ static void uart_event_task(void *pvParameters)
 
     static int current_pid = -1;
     static size_t rxd_len = 0;
-    static size_t prbs_seq = 0;
 
     for (;;)
     {
@@ -207,29 +251,40 @@ static void uart_event_task(void *pvParameters)
                     case 0x64:;
                         // Request power -> always respond
                         // Uncomment the below if using the original circuit from stevew817.
-                        //static const uint8_t frame[2] = {0x9A, 0x01};
-                        //uart_tx_chars(EX_UART_NUM, (char *)&frame, 2);
+                        // static const uint8_t frame[2] = {0x9A, 0x01};
+                        // uart_tx_chars(EX_UART_NUM, (char *)&frame, 2);
                         break;
                     case 0xE7:
                         // Safety sequence -> respond in sequence for as long as there is an active command
                         current_pid = -1; // Discard - do not need to make thread aware of PRBS
 
+                        if (xSemaphoreTake(gLinDataMutex, (TickType_t)10) == pdTRUE)
+                        {
+                            if (tx_len > 0)
+                            {
+                                uart_tx_chars(EX_UART_NUM, (char *)&prbs_sequence[prbs_seq], 2);
+                                prbs_seq = (prbs_seq + 1) % 9;
+                            }
+                            xSemaphoreGive(gLinDataMutex);
+                        }
+                        break;
+                    case 0xA8: // ID40
                         if (tx_len > 0)
                         {
                             uart_tx_chars(EX_UART_NUM, (char *)&prbs_sequence[prbs_seq], 2);
-
-                            // Progress with next PRBS sequence (unless it's updated again by HS2)
-                            prbs_seq += 1;
-                            if (prbs_seq >= 9)
-                                prbs_seq = 0;
+                            prbs_seq = (prbs_seq + 1) % 9;
                         }
                         break;
                     case 0xCA:
                         // Ref1 input -> respond with command if there is one
-                        if (tx_len == 4 && txbuf[0] == 0xCA)
+                        if (xSemaphoreTake(gLinDataMutex, (TickType_t)10) == pdTRUE)
                         {
-                            uint8_t frame[3] = {txbuf[1], txbuf[2], txbuf[3]};
-                            uart_tx_chars(EX_UART_NUM, (char *)&frame, 3);
+                            if (tx_len == 4 && txbuf[0] == 0xCA)
+                            {
+                                uint8_t frame[3] = {txbuf[1], txbuf[2], txbuf[3]};
+                                uart_tx_chars(EX_UART_NUM, (char *)&frame, 3);
+                            }
+                            xSemaphoreGive(gLinDataMutex);
                         }
                         break;
                     default:
@@ -276,7 +331,7 @@ static void uart_event_task(void *pvParameters)
                 {
                     rxbuf[0] = current_pid;
                     rx_len = rxd_len;
-                    xSemaphoreGive(gLinSemaphoreId);
+                    xSemaphoreGive(gDeskTaskSemaphore);
                 }
                 rxd_len = 0;
                 current_pid = -1;
@@ -316,112 +371,137 @@ static uint8_t calc_lin_checksum(volatile uint8_t *buf, size_t buf_len)
     return ~((uint8_t)checksum);
 }
 
+// Define states for clarity
+typedef enum
+{
+    DESK_STATE_IDLE,
+    DESK_STATE_MOVING,
+    DESK_STATE_STOPPING
+} desk_state_t;
+
 static void desk_task(void *arg)
 {
-    vSemaphoreCreateBinary(gLinSemaphoreId);
+    gLinDataMutex = xSemaphoreCreateMutex();
+    gDeskTaskSemaphore = xSemaphoreCreateBinary();
 
-    ESP_LOGI(TAG, "desk task");
+    if (gLinDataMutex == NULL || gDeskTaskSemaphore == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create semaphores");
+        vTaskDelete(NULL);
+    }
 
-    int64_t last_tick = 0;
-    uint16_t last_height = 0;
+    ESP_LOGI(TAG, "desk task started");
+
+    desk_state_t state = DESK_STATE_IDLE;
+    int64_t last_move_time = 0;
+    uint16_t last_reported_height = 0;
+    const int64_t STALL_TIMEOUT_US = 2000000; // 2 seconds, be generous
+    const uint16_t HEIGHT_TOLERANCE = 5;      // 0.5mm tolerance
+
     while (1)
     {
-        xSemaphoreTake(gLinSemaphoreId, portMAX_DELAY);
-
-        // Got poked by ISR
-        if (rxbuf[0] == 0x80)
+        // Wait for a position update from the LIN bus
+        if (xSemaphoreTake(gDeskTaskSemaphore, portMAX_DELAY) == pdTRUE)
         {
-            uint16_t pos = rxbuf[1] + (rxbuf[2] << 8);
-
-            if (pos != current_height)
+            // We only process valid position frames (ID 0x80)
+            if (rxbuf[0] != 0x80)
             {
-                ESP_LOGI(TAG, "current id: %x, current pos: %u", rxbuf[0], (unsigned int)pos);
-
-                if (current_height == 0)
-                {
-                    // Publish current height to MQTT.
-                    char payload[6];
-                    snprintf(payload, sizeof(payload), "%u", pos);
-                    esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
-                }
-
-                current_height = pos;
+                continue;
             }
 
-            if (is_moving)
-            {
-                if (last_height != current_height)
-                {
-                    last_height = current_height;
-                    last_tick = esp_timer_get_time();
-                }
-                else if (esp_timer_get_time() >= last_tick + timeout_ticks)
-                {
-                    movement_blocked = true;
-                }
-            }
+            current_height = rxbuf[1] + (rxbuf[2] << 8);
 
-            if (movement_requested)
+            // --- State Machine Logic ---
+            xSemaphoreTake(gLinDataMutex, portMAX_DELAY);
+
+            switch (state)
             {
-                if (!is_moving)
+            case DESK_STATE_IDLE:
+                if (movement_requested)
                 {
-                    if (current_height != target_height)
+                    if (abs(current_height - target_height) > HEIGHT_TOLERANCE)
                     {
-                        ESP_LOGI(TAG, "movement requested, current: %d, target: %d", current_height, target_height);
+                        ESP_LOGI(TAG, "Starting movement from %d to %d", current_height, target_height);
 
-                        // Power on the desk.
-                        // Comment the below if using the original circuit from stevew817.
-                        gpio_set_level(WAKE_UP_PIN, 1);
-                        gpio_set_level(WAKE_UP_PIN, 0);
-
+                        // Set the move command
                         current_target_height = target_height;
                         txbuf[0] = 0xCA;
                         txbuf[1] = current_target_height & 0xFF;
                         txbuf[2] = (current_target_height >> 8) & 0xFF;
                         txbuf[3] = calc_lin_checksum(txbuf, 3);
                         tx_len = 4;
-                        last_tick = esp_timer_get_time();
-                        last_height = current_height;
-                        movement_blocked = false;
-                        is_moving = true;
+
+                        last_move_time = esp_timer_get_time();
+                        last_reported_height = current_height;
+                        state = DESK_STATE_MOVING;
+                    }
+                    else
+                    {
+                        // Already at target, clear request
+                        movement_requested = false;
                     }
                 }
-                else if (movement_blocked || (current_height == current_target_height))
-                {
-                    ESP_LOGI(TAG, "reached target");
-                    // Made it to target, or motor stopped by itself
-                    tx_len = 0;
-                    is_moving = false;
-                    movement_requested = false;
-                    movement_blocked = false;
+                break;
 
-                    // Publish current height to MQTT.
+            case DESK_STATE_MOVING:
+                // Check for completion
+                if (abs(current_height - current_target_height) <= HEIGHT_TOLERANCE)
+                {
+                    ESP_LOGI(TAG, "Target reached: %d", current_height);
+                    state = DESK_STATE_STOPPING;
+                }
+                // Check for explicit stop request
+                else if (!movement_requested)
+                {
+                    ESP_LOGW(TAG, "Movement cancelled by user");
+                    state = DESK_STATE_STOPPING;
+                }
+                // Check for stall
+                else
+                {
+                    if (current_height != last_reported_height)
+                    {
+                        // Height has changed, movement is good. Reset stall timer.
+                        last_move_time = esp_timer_get_time();
+                        last_reported_height = current_height;
+                        // Reduce logging verbosity to avoid slowing down the task
+                        // ESP_LOGI(TAG, "Height: %d", current_height);
+                    }
+                    else if (esp_timer_get_time() - last_move_time > STALL_TIMEOUT_US)
+                    {
+                        ESP_LOGE(TAG, "Movement stalled!");
+                        state = DESK_STATE_STOPPING;
+                    }
+                }
+
+                // If we are still moving, ensure tx_len is set. This is redundant but safe.
+                if (state == DESK_STATE_MOVING)
+                {
+                    tx_len = 4;
+                }
+                break;
+
+            case DESK_STATE_STOPPING:
+                // This state is entered to signal that we should stop.
+                // The command is cleared here once.
+                tx_len = 0;
+                movement_requested = false;
+                is_moving = false; // Compatibility with your other flags
+                ESP_LOGI(TAG, "Movement stopped. Final height: %u", current_height);
+
+                // Publish final height to MQTT
+                if (wifi_connected && mqttClient)
+                {
                     char payload[6];
                     snprintf(payload, sizeof(payload), "%u", current_height);
                     esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
                 }
-                else if (target_height != current_target_height)
-                {
-                    // Target was updated while in motion, need to handle this by allowing motor to stop and restart movement
-                    // TODO
-                }
-            }
-            else
-            {
-                if (is_moving)
-                {
-                    // We were moving but got aborted. Report current state and reset.
-                    tx_len = 0;
-                    is_moving = false;
-                    movement_requested = false;
-                    movement_blocked = false;
 
-                    // Publish current height to MQTT.
-                    char payload[6];
-                    snprintf(payload, sizeof(payload), "%u", current_height);
-                    esp_mqtt_client_publish(mqttClient, MQTT_HEIGHT_TOPIC, (const char *)payload, strlen(payload), 0, 0);
-                }
+                state = DESK_STATE_IDLE;
+                break;
             }
+
+            xSemaphoreGive(gLinDataMutex);
         }
     }
 }
@@ -440,7 +520,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
-        esp_mqtt_client_reconnect(client);
+        // Only attempt MQTT reconnection if WiFi is still connected
+        if (wifi_connected)
+        {
+            esp_mqtt_client_reconnect(client);
+        }
         break;
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
@@ -477,7 +561,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
                 // We received a new height, release the semaphore to let the desk task determine what to do.
                 // Not sure if this is the best way to do it, but it works.
-                xSemaphoreGive(gLinSemaphoreId);
+                xSemaphoreGive(gLinDataMutex);
             }
             else
             {
@@ -510,8 +594,8 @@ void app_main()
     // Bring to ground to not interfere with passive matrix scanning.
     // This actually pulls HB04 away from GND.
     // Uncomment the below if using the original circuit from stevew817.
-    //gpio_set_direction(WAKE_UP_PIN, GPIO_MODE_OUTPUT_OD);
-    //gpio_set_level(WAKE_UP_PIN, 0);
+    // gpio_set_direction(WAKE_UP_PIN, GPIO_MODE_OUTPUT_OD);
+    // gpio_set_level(WAKE_UP_PIN, 0);
 
     // I am powering my ESP32 from USB, so I use a slightly different circuit with a resistor from base to GND instead of base to HB04.
     // Setting the pin to low powers off the desk entirely, setting it high keeps the desk on.
