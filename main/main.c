@@ -184,7 +184,7 @@ void wifi_init_sta(void)
 static QueueHandle_t uart0_queue;
 
 // Replace gLinSemaphoreId for this purpose, we will use it as a proper mutex
-SemaphoreHandle_t gLinDataMutex = NULL;
+static portMUX_TYPE gLinDataSpinlock = portMUX_INITIALIZER_UNLOCKED;
 
 // The semaphore to wake the desk_task can be separate or you can use task notifications
 SemaphoreHandle_t gDeskTaskSemaphore = NULL;
@@ -258,33 +258,33 @@ static void uart_event_task(void *pvParameters)
                         // Safety sequence -> respond in sequence for as long as there is an active command
                         current_pid = -1; // Discard - do not need to make thread aware of PRBS
 
-                        if (xSemaphoreTake(gLinDataMutex, (TickType_t)10) == pdTRUE)
-                        {
-                            if (tx_len > 0)
-                            {
-                                uart_tx_chars(EX_UART_NUM, (char *)&prbs_sequence[prbs_seq], 2);
-                                prbs_seq = (prbs_seq + 1) % 9;
-                            }
-                            xSemaphoreGive(gLinDataMutex);
-                        }
-                        break;
-                    case 0xA8: // ID40
+                        taskENTER_CRITICAL(&gLinDataSpinlock);
                         if (tx_len > 0)
                         {
                             uart_tx_chars(EX_UART_NUM, (char *)&prbs_sequence[prbs_seq], 2);
                             prbs_seq = (prbs_seq + 1) % 9;
                         }
+                        taskEXIT_CRITICAL(&gLinDataSpinlock);
+                        break;
+                    case 0xA8: // ID40
+                        taskENTER_CRITICAL(&gLinDataSpinlock);
+                        if (tx_len > 0)
+                        {
+                            uart_tx_chars(EX_UART_NUM, (char *)&prbs_sequence[prbs_seq], 2);
+                            prbs_seq = (prbs_seq + 1) % 9;
+                        }
+                        taskEXIT_CRITICAL(&gLinDataSpinlock);
                         break;
                     case 0xCA:
                         // Ref1 input -> respond with command if there is one
-                        if (xSemaphoreTake(gLinDataMutex, (TickType_t)10) == pdTRUE)
+                        taskENTER_CRITICAL(&gLinDataSpinlock);
+                        if (tx_len == 4 && txbuf[0] == 0xCA)
                         {
-                            if (tx_len == 4 && txbuf[0] == 0xCA)
-                            {
-                                uint8_t frame[3] = {txbuf[1], txbuf[2], txbuf[3]};
-                                uart_tx_chars(EX_UART_NUM, (char *)&frame, 3);
-                            }
-                            xSemaphoreGive(gLinDataMutex);
+                            uint8_t frame[3] = {txbuf[1], txbuf[2], txbuf[3]};
+                            taskEXIT_CRITICAL(&gLinDataSpinlock);
+                            uart_tx_chars(EX_UART_NUM, (char *)&frame, 3);
+                        } else {
+                            taskEXIT_CRITICAL(&gLinDataSpinlock);
                         }
                         break;
                     default:
@@ -381,10 +381,9 @@ typedef enum
 
 static void desk_task(void *arg)
 {
-    gLinDataMutex = xSemaphoreCreateMutex();
     gDeskTaskSemaphore = xSemaphoreCreateBinary();
 
-    if (gLinDataMutex == NULL || gDeskTaskSemaphore == NULL)
+    if (gDeskTaskSemaphore == NULL)
     {
         ESP_LOGE(TAG, "Failed to create semaphores");
         vTaskDelete(NULL);
@@ -404,16 +403,11 @@ static void desk_task(void *arg)
         if (xSemaphoreTake(gDeskTaskSemaphore, portMAX_DELAY) == pdTRUE)
         {
             // We only process valid position frames (ID 0x80)
-            if (rxbuf[0] != 0x80)
-            {
-                continue;
-            }
+            if (rxbuf[0] != 0x80) continue;
 
             current_height = rxbuf[1] + (rxbuf[2] << 8);
 
             // --- State Machine Logic ---
-            xSemaphoreTake(gLinDataMutex, portMAX_DELAY);
-
             switch (state)
             {
             case DESK_STATE_IDLE:
@@ -425,11 +419,14 @@ static void desk_task(void *arg)
 
                         // Set the move command
                         current_target_height = target_height;
+
+                        taskENTER_CRITICAL(&gLinDataSpinlock);
                         txbuf[0] = 0xCA;
                         txbuf[1] = current_target_height & 0xFF;
                         txbuf[2] = (current_target_height >> 8) & 0xFF;
-                        txbuf[3] = calc_lin_checksum(txbuf, 3);
+                        txbuf[3] = calc_lin_checksum((volatile uint8_t*)txbuf, 3);
                         tx_len = 4;
+                        taskEXIT_CRITICAL(&gLinDataSpinlock);
 
                         last_move_time = esp_timer_get_time();
                         last_reported_height = current_height;
@@ -464,8 +461,6 @@ static void desk_task(void *arg)
                         // Height has changed, movement is good. Reset stall timer.
                         last_move_time = esp_timer_get_time();
                         last_reported_height = current_height;
-                        // Reduce logging verbosity to avoid slowing down the task
-                        // ESP_LOGI(TAG, "Height: %d", current_height);
                     }
                     else if (esp_timer_get_time() - last_move_time > STALL_TIMEOUT_US)
                     {
@@ -477,14 +472,19 @@ static void desk_task(void *arg)
                 // If we are still moving, ensure tx_len is set. This is redundant but safe.
                 if (state == DESK_STATE_MOVING)
                 {
+                    taskENTER_CRITICAL(&gLinDataSpinlock);
                     tx_len = 4;
+                    taskEXIT_CRITICAL(&gLinDataSpinlock);
                 }
                 break;
 
             case DESK_STATE_STOPPING:
                 // This state is entered to signal that we should stop.
                 // The command is cleared here once.
+                taskENTER_CRITICAL(&gLinDataSpinlock);
                 tx_len = 0;
+                taskEXIT_CRITICAL(&gLinDataSpinlock);
+                
                 movement_requested = false;
                 is_moving = false; // Compatibility with your other flags
                 ESP_LOGI(TAG, "Movement stopped. Final height: %u", current_height);
@@ -500,8 +500,6 @@ static void desk_task(void *arg)
                 state = DESK_STATE_IDLE;
                 break;
             }
-
-            xSemaphoreGive(gLinDataMutex);
         }
     }
 }
@@ -556,12 +554,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
             if (*endptr == '\0' && received_long >= 0 && received_long <= UINT16_MAX)
             {
+                taskENTER_CRITICAL(&gLinDataSpinlock);
+
                 target_height = (uint16_t)received_long;
                 movement_requested = true;
 
-                // We received a new height, release the semaphore to let the desk task determine what to do.
-                // Not sure if this is the best way to do it, but it works.
-                xSemaphoreGive(gLinDataMutex);
+                taskEXIT_CRITICAL(&gLinDataSpinlock);
+
+                xSemaphoreGive(gDeskTaskSemaphore);
             }
             else
             {
