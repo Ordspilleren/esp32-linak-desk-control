@@ -645,10 +645,10 @@ void app_main()
     uart_set_line_inverse(EX_UART_NUM, UART_SIGNAL_TXD_INV);
 
     // Create UART event task
-    xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 3, NULL);
+    xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, configMAX_PRIORITIES - 1, NULL);
 
     // Create task for handling desk movement logic
-    xTaskCreate(desk_task, "desk_task", 2048, NULL, 2, NULL);
+    xTaskCreate(desk_task, "desk_task", 4096, NULL, configMAX_PRIORITIES - 2, NULL);
 
     // Start MQTT
     mqtt_app_start();
