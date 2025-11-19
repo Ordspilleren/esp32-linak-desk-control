@@ -200,7 +200,6 @@ volatile uint16_t current_target_height = 0;
 volatile bool is_moving = false;
 volatile bool movement_requested = false;
 volatile bool movement_blocked = false;
-static int64_t timeout_ticks = 1500000;
 
 // PRBS (safety sequence) responses
 // The first byte is the actual PRBS number.
@@ -416,6 +415,11 @@ static void desk_task(void *arg)
                     if (abs(current_height - target_height) > HEIGHT_TOLERANCE)
                     {
                         ESP_LOGI(TAG, "Starting movement from %d to %d", current_height, target_height);
+
+                        // Power on the desk.
+                        // Comment the below if using the original circuit from stevew817.
+                        gpio_set_level(WAKE_UP_PIN, 1);
+                        gpio_set_level(WAKE_UP_PIN, 0);
 
                         // Set the move command
                         current_target_height = target_height;
